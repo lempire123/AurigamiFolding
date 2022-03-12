@@ -259,9 +259,7 @@ contract AurigamiFolding is Ownable {
 
     Comptroller comptroller = Comptroller(0xdF9361edfde4ebb90e32fDb4671AA221eaf24F46);
     
-    // Sets the address of the owner
-    constructor(address _owner)  {
-        owner = _owner;
+    constructor()  {
 
         // enable all assets to be used as collateral
         address[] markets = comptroller.getAllMarkets()
