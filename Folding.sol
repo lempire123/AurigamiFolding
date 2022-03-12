@@ -266,7 +266,6 @@ contract AurigamiFolding is Ownable {
         comptroller.enterMarkets(markets);
 
         // approve all assets to be accessed by the corresponding auToken
-        // create a map of the underlying token to its corresponding auToken
         for(uint i; i < markets.length; i++) {
             IERC20(markets[i].underlying()).approve(address(markets[i]), 2**256 - 1);
         }
