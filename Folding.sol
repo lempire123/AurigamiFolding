@@ -166,6 +166,10 @@ interface IERC20 {
 }
 
 interface auTOKEN {
+
+
+    /*** User Interface ***/
+
     function transfer(address dst, uint amount) external returns (bool);
     function transferFrom(address src, address dst, uint amount) external returns (bool);
     function approve(address spender, uint amount) external returns (bool);
@@ -177,17 +181,23 @@ interface auTOKEN {
     function supplyRatePerBlock() external view returns (uint);
     function totalBorrowsCurrent() external returns (uint);
     function borrowBalanceCurrent(address account) external returns (uint);
-    function borrowBalanceStored(address account) public view returns (uint);
-    function exchangeRateCurrent() public returns (uint);
-    function exchangeRateStored() public view returns (uint);
+    function borrowBalanceStored(address account) external view returns (uint);
+    function exchangeRateCurrent() external returns (uint);
+    function exchangeRateStored() external view returns (uint);
     function getCash() external view returns (uint);
-    function accrueInterest() public returns (uint);
+    function accrueInterest() external returns (uint);
     function seize(address liquidator, address borrower, uint seizeTokens) external returns (uint);
+    function underlying() external view returns (address);
+
+    function mint(uint256 amount) external;
+    function borrow(uint256 amount) external;
+    function redeem(uint256 amount) external;
+    function repayBorrow(uint256 amount) external;
+ 
+
 }
 
 interface Comptroller {
-     /// @notice Indicator that this is a Comptroller contract (for inspection)
-    bool public constant isComptroller = true;
 
     /*** Assets You Are In ***/
 
@@ -253,6 +263,11 @@ interface Comptroller {
         address cTokenBorrowed,
         address cTokenCollateral,
         uint repayAmount) external view returns (uint, uint);
+
+    // View function
+    function getAllMarkets() external view returns (address[] memory);
+    function markets(address token) external view returns (bool, uint256, bool);
+    function getAccountLiquidity(address user) external view returns (uint256);
 }
 
 contract AurigamiFolding is Ownable {
@@ -262,43 +277,46 @@ contract AurigamiFolding is Ownable {
     constructor()  {
 
         // enable all assets to be used as collateral
-        address[] markets = comptroller.getAllMarkets()
+        address[] memory markets = comptroller.getAllMarkets();
         comptroller.enterMarkets(markets);
 
         // approve all assets to be accessed by the corresponding auToken
         for(uint i; i < markets.length; i++) {
-            IERC20(markets[i].underlying()).approve(address(markets[i]), 2**256 - 1);
+            IERC20(auTOKEN(markets[i]).underlying()).approve(address(markets[i]), 2**256 - 1);
         }
     }
 
     // Allows user to deposit assets into the contract
     function depositAsset(address asset, uint256 amount) public {
-        require(tokenToAuToken[asset] != address(0), "Asset not available")
+        require(getAuToken(asset) != address(0), "Asset not available");
         IERC20(asset).transferFrom(msg.sender, address(this), amount);
     }
 
     // Function that will fold an asset to collateral factor 5% less than the max
     function foldSafeMax(address asset, uint256 initialAmount) public onlyOwner {
         //Fetch corresponding auToken
-        auToken token = auToken(getAuToken(asset));
+        auTOKEN token = auTOKEN(getAuToken(asset));
+
+        uint256 maxCollateralFactor;
         // Fetches the max collateralFactor for the specific asset (must divide by 10**18)
         (, maxCollateralFactor,) = comptroller.markets(address(token));
         // The minus 5 ensures that the likelihood of liquidation is very low 
-        fold(asset, initialAmount, (maxCollateralFactor/10**18) - 0.05);
+        fold(asset, initialAmount, (maxCollateralFactor/10**18) * 5/100);
     }
 
     // Main function in charge of folding
     function fold(address asset, uint256 initialAmount, uint256 collateralFactorDesired) public {
         // Checks that caller is owner or contract itself
-        require(msg.sender == owner || msg.sender == address(this), "Can only be accessed by owner");
+        require(msg.sender == owner() || msg.sender == address(this), "Can only be accessed by owner");
 
         //Fetch corresponding auToken
-        auToken token = auToken(getAuToken(asset));
+        auTOKEN token = auTOKEN(getAuToken(asset));
+        uint256 maxCollateralFactor;
         // Fetches the max collateralFactor for the specific asset
         (, maxCollateralFactor,) = comptroller.markets(address(token));
         
         // Mints the initialAmount deposited by the user
-        auToken.mint(initialAmount);
+        supply(token, initialAmount);
 
         // Supply amount equals the amount to be deposited
         // Borrow amount equals the amount to be borrowed
@@ -307,10 +325,10 @@ contract AurigamiFolding is Ownable {
 
         uint256 currentCollateralFactor = 0;
 
-        while currentCollateralFactor < collateralFactorDesired {
-            borrow(auToken, IERC20(asset), borrowAmount);
+        while (currentCollateralFactor < collateralFactorDesired) {
+            borrow(token, borrowAmount);
             supplyAmount = borrowAmount;
-            supply(auToken, IERC20(asset), supplyAmount);
+            supply(token, supplyAmount);
             currentCollateralFactor = calculateCollateralFactor(token);
         }
     }
@@ -318,13 +336,13 @@ contract AurigamiFolding is Ownable {
     function unWind(address asset) public onlyOwner {
         
         //Fetch corresponding auToken
-        auToken token = auToken(getAuToken(asset));
+        auTOKEN token = auTOKEN(getAuToken(asset));
 
         uint256 maxWithdrawable = getWithdrawableAmount();
 
-        while token.balanceOf(address(this)) > 0 {
+        while (token.balanceOf(address(this)) > 0) {
             redeemUnderlying(token, maxWithdrawable);
-            repayBorrow(token, maxWithdrawable);
+            repay(token, maxWithdrawable);
             maxWithdrawable = getWithdrawableAmount();
         }
     }
@@ -333,8 +351,8 @@ contract AurigamiFolding is Ownable {
     function addCollateral(address asset, uint amount) public onlyOwner {
         IERC20(asset).transferFrom(msg.sender, address(this), amount);
         //Fetch corresponding auToken
-        auToken token = auToken(getAuToken(asset));
-        auToken.mint(amount);
+        auTOKEN token = auTOKEN(getAuToken(asset));
+        supply(token, amount);
     }
 
 
@@ -355,7 +373,7 @@ contract AurigamiFolding is Ownable {
     }
 
     function repay(auTOKEN token, uint256 amount) internal {
-        token.repayBorrow();
+        token.repayBorrow(amount);
     } 
 
 
@@ -363,21 +381,21 @@ contract AurigamiFolding is Ownable {
     // =========== GETTER FUNCTION =============== //
 
     function getAuToken(address asset) public view returns (address) {
-        address[] markets = comptroller.getAllMarkets()
+        address[] memory markets = comptroller.getAllMarkets();
         for(uint256 i; i < markets.length; i++) {
-            if(markets[i].underlying() == asset) {
+            if(auTOKEN(markets[i]).underlying() == asset) {
                 return markets[i];
             }
         }
     }
 
     function getWithdrawableAmount() public view returns (uint256) {
-        return comptroller.getAccountLiquidity();
+        return comptroller.getAccountLiquidity(address(this));
     }
 
-    function calculateCollateralFactor(auToken token) private view returns (uint256) {
+    function calculateCollateralFactor(auTOKEN token) public view returns (uint256) {
         uint256 totalDeposited = token.balanceOf(address(this)) * token.exchangeRateStored();
         uint256 totalBorrowed = token.borrowBalanceStored(address(this));
-        return totalBorrowed / totalDeposited;
+        return (totalBorrowed / totalDeposited);
     }     
 }
