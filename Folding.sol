@@ -193,7 +193,7 @@ interface auTOKEN {
     function borrow(uint256 amount) external;
     function redeem(uint256 amount) external;
     function repayBorrow(uint256 amount) external;
- 
+
 
 }
 
@@ -270,15 +270,33 @@ interface Comptroller {
     function getAccountLiquidity(address user) external view returns (uint256);
 }
 
+/*
+A small bug is the owner of this contract will be the factory and not the user. I think the final owner
+of this contract can be passed in the constructor, and transferOwnership to the final owner to be done
+at the end of the constructor
+*/
 contract AurigamiFolding is Ownable {
 
-    Comptroller comptroller = Comptroller(0xdF9361edfde4ebb90e32fDb4671AA221eaf24F46);
-    
+    Comptroller public comptroller = Comptroller(0xdF9361edfde4ebb90e32fDb4671AA221eaf24F46);
+
     constructor()  {
 
         // enable all assets to be used as collateral
         address[] memory markets = comptroller.getAllMarkets();
         comptroller.enterMarkets(markets);
+        /*
+        So in Aurigami, there are certain assets that can't be used as collateral (yet).
+        As such, simply entering all markets will cause auto revert.
+        */
+
+        /*
+        Let's only enter markets when the user does deposit assets, because the only reason
+        they do deposit here is to do folding, and to do folding, the assets must be allowed to
+        use as collateral
+
+        Plus, it supports new assets if Aurigami adds it as well
+
+        */
 
         // approve all assets to be accessed by the corresponding auToken
         for(uint i; i < markets.length; i++) {
@@ -289,6 +307,16 @@ contract AurigamiFolding is Ownable {
     // Allows user to deposit assets into the contract
     function depositAsset(address asset, uint256 amount) public {
         require(getAuToken(asset) != address(0), "Asset not available");
+
+        /*
+        the logic of transferFrom you are doing here is correct. However, it's strictly better
+        to do safeTransferFrom (do using SafeERC20 for IERC20 after importing SafeERC20 from OpenZeppelin)
+
+        The rationale is that some ERC20 tokens, instead of revert on failure, simply return false,
+        and the caller needs to check the return result to be non-false before proceeding.
+        You can read more here: https://medium.com/coinmonks/missing-return-value-bug-at-least-130-tokens-affected-d67bf08521ca
+        Pretty informative read!
+        */
         IERC20(asset).transferFrom(msg.sender, address(this), amount);
     }
 
@@ -300,8 +328,21 @@ contract AurigamiFolding is Ownable {
         uint256 maxCollateralFactor;
         // Fetches the max collateralFactor for the specific asset (must divide by 10**18)
         (, maxCollateralFactor,) = comptroller.markets(address(token));
-        // The minus 5 ensures that the likelihood of liquidation is very low 
+        // The minus 5 ensures that the likelihood of liquidation is very low
         fold(asset, initialAmount, (maxCollateralFactor/10**18) * 5/100);
+
+        /*
+        So here, a bit about the norm of integer behaviors in most programming language:
+        In normal math: 1 / 2 = 0.5
+        In most PL: 1 / 2 = floor(1/2) = 0, (2e18-1) / 1e18 = 1
+
+        As such, the vanila division doesn't work well, and it requires the use of Fixed Point arithmetic
+
+        For this `(maxCollateralFactor/10**18) * 5/100` expression, the correct expression is:
+        rdiv(maxCollateralFactor*5,10**18 * 100)
+
+        Also, I think it should be * 95/100 instead (aka the collateral factor is 95% the maxCollateralFactor)
+        */
     }
 
     // Main function in charge of folding
@@ -309,12 +350,18 @@ contract AurigamiFolding is Ownable {
         // Checks that caller is owner or contract itself
         require(msg.sender == owner() || msg.sender == address(this), "Can only be accessed by owner");
 
+        /*
+        Just FYI here: if the contract calls one of its functions, the msg.sender will still be the
+        original msg.sender. Only when the contracts calls another contract that the msg.sender will be
+        changed to the caller's address
+        */
+
         //Fetch corresponding auToken
         auTOKEN token = auTOKEN(getAuToken(asset));
         uint256 maxCollateralFactor;
         // Fetches the max collateralFactor for the specific asset
         (, maxCollateralFactor,) = comptroller.markets(address(token));
-        
+
         // Mints the initialAmount deposited by the user
         supply(token, initialAmount);
 
@@ -326,6 +373,18 @@ contract AurigamiFolding is Ownable {
         uint256 currentCollateralFactor = 0;
 
         while (currentCollateralFactor < collateralFactorDesired) {
+            /*
+            I think everytime borrow the same borrowAmount may not be correct
+            Because it's not possible to borrow the same amount every time. After you have resupply
+            the borrowAmount, you can borrow at most maxCollateralFactor * borrowAmount
+
+            So for example, on the 2nd borrow, you can borrow at most maxCollateralFactor^2 * original
+            supplyAmount
+
+            Also, I think we need to check to make sure that post-borrow, the currentCollateralFactor
+            is strictly smaller than the collateralFactorDesired. With the current while condition,
+            the folding will only stop when the condition is wrong, aka currentCollateralFactor >= collateralFactorDesired
+            */
             borrow(token, borrowAmount);
             supplyAmount = borrowAmount;
             supply(token, supplyAmount);
@@ -334,7 +393,7 @@ contract AurigamiFolding is Ownable {
     }
 
     function unWind(address asset) public onlyOwner {
-        
+
         //Fetch corresponding auToken
         auTOKEN token = auTOKEN(getAuToken(asset));
 
@@ -342,6 +401,7 @@ contract AurigamiFolding is Ownable {
 
         while (token.balanceOf(address(this)) > 0) {
             redeemUnderlying(token, maxWithdrawable);
+            // nice here, but you can check to repay only when the amount owed is > 0
             repay(token, maxWithdrawable);
             maxWithdrawable = getWithdrawableAmount();
         }
@@ -358,7 +418,7 @@ contract AurigamiFolding is Ownable {
 
 
 
-    // ======== BASIC FUNCTIONs TO INTERACT WITH AURIGAMI ======== // 
+    // ======== BASIC FUNCTIONs TO INTERACT WITH AURIGAMI ======== //
 
     function supply(auTOKEN token, uint256 amount) internal {
         token.mint(amount);
@@ -374,7 +434,7 @@ contract AurigamiFolding is Ownable {
 
     function repay(auTOKEN token, uint256 amount) internal {
         token.repayBorrow(amount);
-    } 
+    }
 
 
 
@@ -394,8 +454,22 @@ contract AurigamiFolding is Ownable {
     }
 
     function calculateCollateralFactor(auTOKEN token) public view returns (uint256) {
+        /*
+        This is also quite similar to the Fixed Point issue above
+        the exchangeRateStored is in Fixed Point, so vaniala multiplication won't work,
+        but it has to be rmul(token.balanceOf(address(this)),token.exchangeRateStored())
+
+        same for totalBorrowed / Deposited, has to be rdiv(totalBorrowed,totalDeposited)
+        */
         uint256 totalDeposited = token.balanceOf(address(this)) * token.exchangeRateStored();
         uint256 totalBorrowed = token.borrowBalanceStored(address(this));
         return (totalBorrowed / totalDeposited);
-    }     
+    }
+
+    /*
+    For all Fixed Point math, please use this simple library https://gist.github.com/UncleGrandpa925/3d0d253c4d12b5105e7ab36189d8f06a
+    Using Foundry, you can play with the library to get the gist of it
+    For example, to get 3.14 in Fixed Point, you can just do 314 / 100 (in Normal Math), or rdiv(314,100)
+    Just play with the library and you will understand it intuitively!
+    */
 }
